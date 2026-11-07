@@ -1,74 +1,63 @@
-# Real-Time Rental Asset & Inventory Tracking
+# rental-asset-tracking-realtime
 
-**Inspired by my work at Furlenco** · PySpark Structured Streaming · Medallion architecture · Microsoft Fabric-ready
+Streaming pipeline that tracks rental assets (TVs, washing machines, treadmills etc.) as they move between warehouses and customers, and keeps a live view of what's actually available to rent in each city.
 
-In a rental business, every physical asset (each TV, washing machine or treadmill) cycles through **stock → dispatched to a customer → returned → refurbished → available again** across city warehouses. This project tracks that lifecycle in near real time, so operations always know **what is rentable right now, where, and how hard the fleet is working**.
+At Furlenco I worked on real-time pipelines for this kind of problem. This repo is a simplified version with **made-up data**. No company code, data or schemas are in here.
 
-> **Independent portfolio project.** It recreates the *kind* of real-time pipeline I built at Furlenco, from scratch, with **synthetic data**. It contains no Furlenco code, data, schemas or business logic and is not affiliated with Furlenco.
+## Why
 
----
+With hourly or daily refreshes, the availability numbers ops look at are always a bit stale. An item gets returned at 11am, and nobody sees it as rentable until the evening refresh. The idea here is to keep asset status current from scan events as they come in.
 
-## Architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    W[Warehouse scanners<br/>& logistics apps] -->|JSON asset events| L[(Landing)]
-    L -->|readStream| B[Bronze<br/>raw + ingest metadata]
-    B --> S[Silver<br/>typed · DQ-flagged ·<br/>de-duplicated]
-    S --> M[Gold: asset_movements_15min]
-    S --> V{Lifecycle<br/>validation}
-    V --> C[Gold: asset_current_status]
-    V --> X[Gold: invalid_transitions]
-    C --> A[Gold: availability_by_city_sku<br/>available · on rent · utilisation · stockout]
-    M --> P[Power BI ops dashboard]
-    A --> P
-    X --> P
+    A[scan events JSON] --> B[bronze]
+    B --> S[silver: typed, deduped, flagged]
+    S --> M[15-min movements]
+    S --> V[lifecycle check]
+    V --> C[current status per asset]
+    V --> X[invalid transitions]
+    C --> AV[availability per city/SKU]
 ```
 
-## Asset lifecycle
+Every asset goes through roughly this cycle:
 
-```mermaid
-stateDiagram-v2
-    [*] --> AVAILABLE: STOCK_IN
-    AVAILABLE --> ON_RENT: DISPATCHED
-    ON_RENT --> PENDING_QC: RETURNED
-    PENDING_QC --> IN_REFURB: REFURB_START
-    IN_REFURB --> AVAILABLE: REFURB_DONE
-    PENDING_QC --> WRITTEN_OFF: WRITE_OFF
-    IN_REFURB --> WRITTEN_OFF: WRITE_OFF
-    AVAILABLE --> WRITTEN_OFF: WRITE_OFF
-```
+`STOCK_IN → AVAILABLE → DISPATCHED (on rent) → RETURNED → REFURB → AVAILABLE`, with `WRITE_OFF` possible after a return or during refurb.
 
-Events that break this lifecycle (for example an asset **dispatched twice** without a return) are caught by `validate_transitions`. They're routed to `invalid_transitions` for the ops team and excluded from the current-status table, so availability numbers stay trustworthy.
+Scanners do weird things in practice. The same event arrives twice, an asset gets "dispatched" while it's still with a customer, or the asset id is missing. So:
 
-## Gold outputs
+- duplicates are dropped with `dropDuplicatesWithinWatermark` on `event_id`
+- rows with missing ids are kept in silver with a `dq_status` flag instead of being thrown away
+- `validate_transitions` checks every event against the previous status of that asset, and anything impossible goes to `invalid_transitions` instead of messing up the availability numbers
 
-| Table | Answers | Refresh |
-|---|---|---|
-| `asset_current_status` | Where is asset X and what state is it in? | every micro-batch |
-| `availability_by_city_sku` | How many units are rentable per city/SKU? Utilisation %? Stock-outs? | every micro-batch |
-| `asset_movements_15min` | Dispatches / returns / refurb flow per city in 15-min windows | streaming append |
-| `invalid_transitions` | Which scans are impossible and need investigation? | every micro-batch |
+Gold tables:
 
-## Data quality
+- `asset_current_status`: latest valid status per asset
+- `availability_by_city_sku`: available / on rent / in refurb, utilisation %, stock-out flag
+- `asset_movements_15min`: dispatches, returns etc. per city in 15-minute windows
+- `invalid_transitions`: for ops to look at
 
-- **Duplicates:** `dropDuplicatesWithinWatermark(event_id)` handles at-least-once delivery with bounded state.
-- **Flags, not drops:** `MISSING_ASSET`, `MISSING_WAREHOUSE` and `UNKNOWN_EVENT` stay in Silver for reconciliation.
-- **Lifecycle rules:** status changes are checked against the state machine above.
-- **Late data:** a 30-minute watermark on event time.
+## Running it
 
-## Run it
+Needs Python 3.10+ and Java 17 for Spark.
 
 ```bash
 pip install -r requirements.txt
 export PYTHONPATH=src
+
 python -m asset_tracking.generator --out data/landing --assets 500 --files 10
 python -m asset_tracking.pipeline --landing data/landing --lake data/lake --once
+
 pytest -q
 ```
 
-On **Microsoft Fabric**, see [docs/fabric.md](docs/fabric.md). In short: the landing zone becomes a Lakehouse folder or Eventstream, tables are Delta, and Gold feeds a Direct Lake Power BI model.
+The generator plants a few bad events on purpose (duplicates, missing ids, double dispatches) so the checks have something to catch.
 
-## Tech
+On Fabric it's the same code with `--format delta`, writing to Lakehouse tables. There are some notes in [docs/fabric.md](docs/fabric.md).
 
-Python · PySpark Structured Streaming · Spark SQL · window functions · state-machine validation · Delta Lake / Microsoft Fabric · pytest · GitHub Actions
+## Known limitations / next steps
+
+- `refresh_status` recomputes current status from the whole silver table each batch. Fine at this size, but for a real fleet I'd switch it to a Delta `MERGE` on `asset_id`.
+- Late events older than the 30-minute watermark are dropped from the windowed counts.
+- An alert on stock-outs (Fabric Activator or a Teams webhook) would be the obvious next addition.
